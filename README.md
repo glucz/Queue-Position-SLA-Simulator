@@ -26,7 +26,7 @@ Key notation: each client has a queue position q in [0, 1] (1 = front, best prot
 The simulator implements the following model:
 
 - **Individual burden:** h(θ, q) = p(q) + θ · d(q), where p(q) is the price at queue position q and d(q) is the expected violation severity
-- **Total economic burden:** H = C · k + W, where W = Σ θᵢ · d(qᵢ) is aggregate welfare loss
+- **Total economic burden:** H = C · k + W, where W = Σ nᵢ · θᵢ · d(qᵢ) is aggregate welfare loss, with nᵢ the workload volume of client i
 - **Fitted severity curve:** d(q) = γ · exp(−δ · q), with γ and δ estimated by log-linear regression on the simulation output
 - **Self-selection position:** q* = 1/2 + ln(θ / θ_ref) / (α + δ), where α is the price exponent and θ_ref is the geometric mean of all client sensitivities, calibrated so the median type sits at q = 0.5
 
