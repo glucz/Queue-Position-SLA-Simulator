@@ -21,6 +21,15 @@ The four scenarios:
 
 Key notation: each client has a queue position q in [0, 1] (1 = front, best protected; 0 = back). The function d(q) is the expected violation severity at position q, and p(q) is the price. A client with sensitivity theta chooses the position that minimizes their burden h(theta, q) = p(q) + theta * d(q). The fitted severity curve takes the form d(q) = gamma * exp(-delta * q), where gamma and delta are estimated from the simulation output. In the welfare comparison tab, W_S and W_P denote aggregate welfare loss under separated and pooled allocation respectively. The price exponent alpha controls the convexity of p(q).
 
+## Key equations
+
+The simulator implements the following model:
+
+- **Individual burden:** h(θ, q) = p(q) + θ · d(q), where p(q) is the price at queue position q and d(q) is the expected violation severity
+- **Total economic burden:** H = C · k + W, where W = Σ θᵢ · d(qᵢ) is aggregate welfare loss
+- **Fitted severity curve:** d(q) = γ · exp(−δ · q), with γ and δ estimated by log-linear regression on the simulation output
+- **Self-selection position:** q* = 1/2 + ln(θ / θ_ref) / (α + δ), where α is the price exponent and θ_ref is the geometric mean of all client sensitivities, calibrated so the median type sits at q = 0.5
+
 ## Quick start
 
 Requires [Node.js](https://nodejs.org/) v18 or later.
@@ -62,7 +71,7 @@ All parameters are adjustable via sliders and update all visualizations immediat
 3. **All Types d(q)** -- Severity redistribution across all four client types, comparing WFQ against equal treatment.
 4. **Burden (H = C*k + W)** -- Stacked bar chart decomposing total economic burden into infrastructure cost and sensitivity-weighted damage for each scenario.
 5. **Theorem 1 (W_S vs W_P)** -- Welfare loss comparison between separated and pooled allocation as a function of infrastructure cost k.
-6. **d(q) and p(q) Curves** -- Side-by-side severity and price curves. Coloured dots mark the optimal queue position q* for each type, computed from the first-order condition q* = ln(theta * delta * gamma / alpha) / (alpha + delta).
+6. **d(q) and p(q) Curves** -- Side-by-side severity and price curves. Coloured dots mark the optimal queue position q* for each type, computed from the calibrated first-order condition q* = 1/2 + ln(theta / theta_ref) / (alpha + delta), where theta_ref is the geometric mean of all client sensitivities.
 7. **Per-Type h(theta, q)** -- Client burden breakdown by type and scenario.
 
 A **Notes** toggle shows or hides explanatory annotations on each chart. Turning notes off produces clean figures suitable for publication.
@@ -75,7 +84,7 @@ When total load in a window exceeds capacity, WFQ assigns weights w(q) = exp(bet
 
 Total burden is H = C*k + W, where C*k is capacity times infrastructure cost and W = sum of theta_i * average_severity_i * work_i across all clients.
 
-After running Scenario A, the simulator fits an exponential gamma * exp(-delta * q) through the (queue position, average severity) scatter using log-linear regression, constrained to delta > 0. The d(q) and p(q) tab then computes optimal queue positions from the first-order condition of h(theta, q) = p(q) + theta * d(q), showing where each client type would self-select on the price curve.
+After running Scenario A, the simulator fits an exponential gamma * exp(-delta * q) through the (queue position, average severity) scatter using log-linear regression, constrained to delta > 0. The d(q) and p(q) tab then computes optimal queue positions from the calibrated first-order condition q* = 1/2 + ln(theta / theta_ref) / (alpha + delta), where theta_ref is the geometric mean of all sensitivities, showing where each client type would self-select on the price curve.
 
 ## Project structure
 
@@ -104,7 +113,7 @@ No server-side computation. Everything runs in the browser.
 ```bibtex
 @software{lucz2026qpsla,
   author    = {Lucz, Géza and Forstner, Bertalan},
-  title     = {Queue-Position SLA Simulator},
+  title     = {{Queue-Position SLA Simulator}},
   version   = {1.0.0},
   year      = {2026},
   publisher = {Zenodo},
