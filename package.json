@@ -1,7 +1,13 @@
 {
   "name": "queue-position-sla-simulator",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
+  "description": "Interactive browser simulator for queue-position cloud SLA design: a Deficit Round Robin severity engine, self-selection on a published convex contract, and welfare/burden decomposition.",
+  "author": "Géza Lucz and Bertalan Forstner",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/glucz/Queue-Position-SLA-Simulator.git" },
+  "homepage": "https://github.com/glucz/Queue-Position-SLA-Simulator#readme",
+  "keywords": ["sla", "cloud-computing", "scheduling", "mechanism-design", "self-selection", "deficit-round-robin", "simulator", "react"],
   "type": "module",
   "scripts": {
     "dev": "vite",
