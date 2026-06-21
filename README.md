@@ -6,7 +6,7 @@ Accompanies the paper:
 
 > Lucz, G. & Forstner, B. (2026). A Reliability Curve Approach to Cloud Service Contract Optimization and Service. SSRN preprint. [https://doi.org/10.2139/ssrn.6881381](https://doi.org/10.2139/ssrn.6881381)
 
-Archived on Zenodo: [https://doi.org/10.5281/zenodo.20026570](https://doi.org/10.5281/zenodo.20026570) (currently the v1.0.0 deposit; a v1.0.1 archive will be added on release).
+Archived on Zenodo: [https://doi.org/10.5281/zenodo.20026570](https://doi.org/10.5281/zenodo.20026570) (latest release).
 
 ## What it does
 
