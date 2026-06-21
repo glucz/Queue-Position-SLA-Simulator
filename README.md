@@ -6,7 +6,7 @@ Accompanies the paper:
 
 > Lucz, G. & Forstner, B. (2026). A Reliability Curve Approach to Cloud Service Contract Optimization and Service. SSRN preprint. [https://doi.org/10.2139/ssrn.6881381](https://doi.org/10.2139/ssrn.6881381)
 
-Archived on Zenodo: [https://doi.org/10.5281/zenodo.20026571](https://doi.org/10.5281/zenodo.20026571) (currently the v1.0.0 deposit; a v1.0.1 archive will be added on release).
+Archived on Zenodo: [https://doi.org/10.5281/zenodo.20026570](https://doi.org/10.5281/zenodo.20026570) (currently the v1.0.0 deposit; a v1.0.1 archive will be added on release).
 
 ## What it does
 
@@ -138,7 +138,7 @@ No server-side computation. Everything runs in the browser.
   version   = {1.0.1},
   year      = {2026},
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.20026571},
+  doi       = {10.5281/zenodo.20026570},
   url       = {https://github.com/glucz/Queue-Position-SLA-Simulator}
 }
 ```
