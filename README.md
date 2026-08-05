@@ -56,6 +56,16 @@ npm run build
 npm run preview
 ```
 
+To check the model invariants, explore the parameter space, or time a recompute:
+
+```bash
+npm test                              # invariant test suite (see Verification)
+npm run sweep                         # parameter-space study, tables to stdout
+npm run sweep -- --csv sweep.csv      # ... and a tidy CSV of every run
+npm run sweep -- --seeds 100          # deeper population-robustness pass
+npm run bench                         # runtime of a full recompute
+```
+
 ## Parameters
 
 All parameters are adjustable via sliders and update all visualizations immediately.
@@ -85,7 +95,13 @@ The contract steepness δ is an **output**: it is fitted to the measured profile
 5. **Infrastructure Cost Sensitivity** — Marginal customer damage prevented per unit of capacity (`−dW/dC`) for separated (green) vs pooled (purple) against the marginal hardware cost *k*, and the welfare loss at the provider's chosen capacity as *k* sweeps.
 6. **Per-Type h(θ, q)** — Per-type burden breakdown (price + damage) by scenario.
 
-A **Notes** toggle shows or hides explanatory annotations on each chart. Turning notes off produces clean figures suitable for publication.
+A **Notes** toggle shows or hides *all* explanatory prose — the intro paragraph, the per-chart
+descriptions and the summary panels — leaving titles, axes, legends and data. Turn notes off to export
+clean figures.
+
+Note on scenario C: its capacity slider is independent of the deployed capacity, so setting it *above*
+the A/B capacity makes C a better-provisioned pooled arm rather than an underdeployed one. Keep it
+below the deployed capacity for the intended "cutting corners" reading.
 
 ## How the simulation works
 
@@ -103,17 +119,57 @@ Each client gets a type, a θ drawn from ±30% of the type mean, a peak hour dra
 
 **Total burden.** `H = C·k + W`, where `C·k` is capacity times infrastructure cost and `W` is the workload-weighted aggregate welfare loss.
 
-With the default population (capAB = 60%, capC = 48%, k = 40, β = 2, wMin = 0.15, α = 3, θ = 0.5/16/8/3, seed 42): the fitted contract has δ ≈ 2.7 (R² ≈ 1.00) and peaks at `d(0) ≈ 0.33`, well below the `d = 1` complete-failure level. `W_S ≈ 15321` vs `W_P ≈ 28824`, a welfare-loss reduction of about **46%** (46.2 ± 1.1% over 30 seeds; min 43.7%, max 48.6%), independent of *k*. The total-burden ranking is **A < D < B < C** (preserved across all 30 seeds); A vs B is about a 25% total-burden reduction. In the Infrastructure Cost Sensitivity tab, at *k* = 40 the welfare-optimal capacity is 78% of peak under separation vs 94% under pooling — the separated menu runs leaner because residual damage falls on low-θ clients.
+With the default population (capAB = 60%, capC = 48%, k = 40, β = 2, wMin = 0.15, α = 3, θ = 0.5/16/8/3, seed 42): the fitted contract has δ ≈ 2.7 (R² ≈ 1.00) and peaks at `d(0) ≈ 0.33`, well below the `d = 1` complete-failure level. `W_S ≈ 15321` vs `W_P ≈ 28824`, a welfare-loss reduction of about **46%** (46.2 ± 1.1% over 30 seeds; min 43.7%, max 48.6%), independent of *k*. The total-burden ranking at the default is **A < D < B < C**; A vs B is about a 25% total-burden reduction. In the Infrastructure Cost Sensitivity tab, at *k* = 40 the welfare-optimal capacity is 78% of peak under separation vs 94% under pooling — the separated menu runs leaner because residual damage falls on low-θ clients.
+
+`A < B` and `A < C` hold in all 30 populations, as does `W_S < W_P`. The position of **D** in that ranking is *k*-dependent and the default sits close to the crossover: honest per-window provisioning is cheaper than the separated menu while hardware is cheap, and dearer once it is expensive. Across 30 populations the crossover falls at *k* ≈ 40 on average (36.75 to 43.75), so at the default *k* = 40 the full ordering `A < D < B < C` appears in 17 of 30 populations, and in 30 of 30 for *k* ≥ 45. Run `npm run sweep` to see this and the other regime boundaries.
+
+## Verification
+
+There is no unit-test suite in the usual sense and no browser/UI test harness. Instead, `npm test`
+checks the **invariants the model must satisfy for its output to mean anything**, each across a range
+of parameter settings rather than at the default alone:
+
+1. **Determinism** — a seed fixes the population and every reported quantity; a new seed changes them.
+2. **Severity bounds** — measured, published and per-client severities all stay in `[0, 1]`.
+3. **Work conservation** — the mean measured severity equals `ε(C)` to within 1e-12: the scheduler
+   neither invents nor destroys severity, it only moves it between positions.
+4. **Budget calibration** — the work-weighted mean of `d(q*)` equals `ε(C)`, which is what makes the
+   A-vs-B comparison a pure rearrangement rather than a change of budget.
+5. **Shape** — the measured profile and the published contract are both convex and decreasing.
+6. **Incentive compatibility** — `q*` is monotone non-decreasing in θ, and two clients with equal θ
+   land at the same position whatever their workload volume (scale independence).
+7. **Separation** — `W_S ≤ W_P` at equal capacity across populations and overload regimes.
+8. **Goodness of fit** — the exponential contract keeps R² > 0.99 across overload regimes.
+9. **Limits and hygiene** — `ε → 0` as capacity approaches peak demand; no `NaN` or `Infinity`
+   anywhere in the corners of the slider box; a flat (uncongested) profile is reported as an invalid
+   shape instead of being fitted to a spurious δ.
+
+Because the engine is a separate module (`src/engine.js`) with no React or DOM dependency, the tests,
+the parameter sweep and the browser UI all execute the same code — the numbers in the paper and the
+numbers on screen cannot drift apart.
+
+## Runtime
+
+A full recompute — generate 1,000 clients, run the scheduler over 96 windows, fit the contract, solve
+every client's position, evaluate all four scenarios — takes about **3 ms** (median 2.6 ms over 50
+repetitions; Intel Core Ultra 9 185H, Node 22). Chart re-rendering, not the model, dominates the
+visible cost of moving a slider. Measure it on your own hardware with `npm run bench`.
 
 ## Project structure
 
 ```
 ├── src/
-│   ├── App.jsx          # All simulation logic and UI (~576 lines)
+│   ├── engine.js        # Simulation engine — pure functions, no React (~230 lines)
+│   ├── App.jsx          # UI and charts (~370 lines)
 │   ├── App.css          # Component styles
 │   ├── main.jsx         # React entry point
 │   ├── index.css        # Root CSS variables
 │   └── assets/          # Images
+├── test/
+│   └── engine.test.mjs  # Invariant test suite (npm test)
+├── scripts/
+│   ├── sweep.mjs        # Parameter-space study, optional CSV export
+│   └── bench.mjs        # Runtime benchmark
 ├── public/              # Favicon, icons
 ├── index.html           # HTML shell
 ├── package.json
@@ -135,7 +191,7 @@ No server-side computation. Everything runs in the browser.
 @software{lucz2026qpsla,
   author    = {Lucz, Géza and Forstner, Bertalan},
   title     = {{Queue-Position SLA Simulator}},
-  version   = {1.0.1},
+  version   = {1.1.0},
   year      = {2026},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.20026570},

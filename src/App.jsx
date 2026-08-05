@@ -1,224 +1,12 @@
 import { useState, useMemo, useCallback } from "react";
 import { Area, LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ComposedChart, ReferenceLine, ReferenceDot, Cell, Scatter, ScatterChart, ZAxis } from "recharts";
 
-function mulberry32(a){return function(){let t=a+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296}}
-const SLOTS=96,slotToHour=s=>s/4,hourToSlot=h=>{let s=Math.round(h*4);if(s<0)s+=SLOTS;if(s>=SLOTS)s-=SLOTS;return s};
+// The model itself lives in ./engine.js — pure functions with no React or DOM dependency, shared
+// verbatim with the invariant tests (test/engine.test.mjs) and the parameter sweep
+// (scripts/sweep.mjs). This file is presentation only: sliders in, charts out.
+import { gen, runSim, DEFAULTS } from "./engine.js";
+
 const fH=h=>{const hh=((Math.floor(h)%24)+24)%24,mm=Math.round((h%1)*60);return`${hh}:${mm.toString().padStart(2,'0')}`};
-
-// Price-curve exponent α in p(q) = e^(α·q), exposed as a slider. Together with the
-// published severity-curve steepness δ (below) it sets the self-selection spread:
-// clients solve q* = 1/2 + ln(θ/θ_ref)/(α+δ). The default is chosen so that
-// α+δ ≈ ln(θ_max/θ_min) for the default population, i.e. the solved positions fill [0,1].
-const PRICE_EXPONENT_DEFAULT = 3;
-// DRR scheduler parameters. β = quantum steepness (curvature of the concave-increasing quantum
-// schedule); wMin = minimum-service floor reserved to every position (no starvation; caps tail
-// severity). The scheduler is run over the 24-h load to produce the measured severity-vs-position
-// profile, and the published contract steepness δ is FITTED to it — δ is no longer a free slider.
-// Defaults chosen so the fitted δ lands near the historical 1.5 for the default population.
-const BETA_DEFAULT = 2;
-const W_MIN_DEFAULT = 0.15;
-
-function gen(n,ratios,thetas,peakMins,peakMaxs,sigmas,seed){
-  const rng=mulberry32(seed),lerp=(a,b)=>a+rng()*(b-a);
-  const amps={batch:[0.5,1.5],gaming:[2,4],webshop:[1.5,3],office:[1,2]};
-  const rT=ratios.batch+ratios.gaming+ratios.webshop+ratios.office,out=[];
-  for(let i=0;i<n;i++){
-    const r=rng()*rT;
-    let type=r<ratios.batch?"batch":r<ratios.batch+ratios.gaming?"gaming":r<ratios.batch+ratios.gaming+ratios.webshop?"webshop":"office";
-    const theta=thetas[type]*lerp(0.7,1.3);
-    let pMin=peakMins[type],pMax=peakMaxs[type],peakH;
-    if(pMin<=pMax){peakH=lerp(pMin,pMax);}
-    else{peakH=lerp(pMin,pMax+24);if(peakH>=24)peakH-=24;}
-    let peakSlot=hourToSlot(peakH);
-    const sigma=sigmas[type]*4;
-    const amp=lerp(amps[type][0],amps[type][1]);
-    const wl=new Float64Array(SLOTS);
-    for(let s=0;s<SLOTS;s++){let d=s-peakSlot;if(d>SLOTS/2)d-=SLOTS;if(d<-SLOTS/2)d+=SLOTS;wl[s]=amp*Math.exp(-0.5*(d/sigma)**2);}
-    let tW=0;for(let s=0;s<SLOTS;s++)tW+=wl[s];
-    out.push({type,theta,workload:wl,totalWork:tW});
-  }
-  return out;
-}
-
-function maxSlotSeverity(totalLoad,cap){
-  let mx=0;
-  for(let s=0;s<SLOTS;s++){if(totalLoad[s]>cap){const fr=Math.min(1,(totalLoad[s]-cap)/totalLoad[s]);if(fr>mx)mx=fr;}}
-  return mx;
-}
-
-// === DRR severity engine (Deficit Round Robin — Shreedhar & Varghese, IEEE/ACM ToN 4(3), 1996) ===
-// Each queue position q∈[0,1] (q=1 = front, best protected) is reserved a quantum = a GUARANTEED
-// minimum service share. The quantum schedule is a floor wMin reserved to EVERY position plus a
-// CONCAVE-increasing remainder, so: (a) the back keeps wMin>0 ⇒ no starvation (tail severity stays
-// below 1, defeating the sigmoid); (b) the guaranteed-rate schedule g(q)=cap·share(q) is
-// concave-increasing ⇒ realized severity s(q)=1−g(q)/demand is CONVEX-decreasing — the
-// diminishing-returns-of-protection shape (moving off the back escapes the bulk of congestion,
-// moving to the very front escapes only the residual). NB: s=1−A·w is an affine DECREASING map of
-// the weight, so s''=−A·w''; convex severity needs CONCAVE weight (a convex weight would give a
-// concave curve). wMin is the "minimum d(q)" floor slider; beta is the quantum steepness.
-function quantumShape(q,beta,wMin){
-  const phi=beta>1e-6?(1-Math.exp(-beta*q))/(1-Math.exp(-beta)):q; // concave-increasing, phi(0)=0,phi(1)=1
-  return wMin+(1-wMin)*phi;
-}
-
-// Run DRR over the 96 windows at capacity `cap`; return the realized severity-vs-position profile
-// [{q,sev}] on an nBins grid. Each position carries an equal demand slice; the scheduler is
-// WORK-CONSERVING (the front's unused capacity is redistributed to the back) — per window we solve
-// for the water level λ so that Σ min(slice, λ·w(q)) = cap, then severity(q) = max(0, 1 − λ·w(q)/slice).
-// Work-conservation guarantees: (a) every severity ∈ [0,1] (it is an unmet fraction), and (b) the
-// work-weighted mean of the profile equals the conserved budget ε (total unmet / total work). The
-// profile is a property of POSITION (not of any client), so there is no circularity with q*(θ).
-function drrSeverityProfile(totalLoad,cap,beta,wMin,nBins=40){
-  const qs=Array.from({length:nBins},(_,i)=>i/(nBins-1));
-  const w=qs.map(q=>quantumShape(q,beta,wMin));
-  const wMinVal=Math.min(...w);
-  const sev=new Array(nBins).fill(0),wsum=new Array(nBins).fill(0);
-  for(let s=0;s<SLOTS;s++){
-    const load=totalLoad[s];if(load<=0)continue;
-    const slice=load/nBins; // demand per position this window
-    if(load<=cap){for(let b=0;b<nBins;b++)wsum[b]+=slice;continue;} // no overload
-    let lo=0,hi=slice/wMinVal+1; // bisect water level λ so Σ min(slice, λ·w(q)) = cap
-    for(let it=0;it<60;it++){const mid=(lo+hi)/2;let tot=0;for(let b=0;b<nBins;b++)tot+=Math.min(slice,mid*w[b]);if(tot>cap)hi=mid;else lo=mid;}
-    const lam=(lo+hi)/2;
-    for(let b=0;b<nBins;b++){const a=Math.min(slice,lam*w[b]);sev[b]+=Math.max(0,1-a/slice)*slice;wsum[b]+=slice;}
-  }
-  return qs.map((q,b)=>({q,sev:wsum[b]>0?sev[b]/wsum[b]:0}));
-}
-
-// Fit the measured profile to γ·e^(−δq) by least squares in LINEAR space. A log-linear fit is
-// dominated by the near-zero front tail (fully-protected positions) and blows δ up; linear-space
-// NLS weights by magnitude. Grid the decay δ, take the closed-form γ for each, keep the min-SSE
-// pair. δ>0 ⇒ genuinely decreasing; δ≤0/flat ⇒ the sliders left the convex-decreasing window.
-function fitDelta(profile){
-  const pts=profile.filter(p=>p.sev>1e-9);
-  if(pts.length<3)return{delta:0,gamma:0,r2:0,shapeValid:false};
-  let best={sse:Infinity,delta:0,gamma:0};
-  for(let d=0.1;d<=12;d+=0.05){
-    let a=0,b=0;for(const p of pts){const e=Math.exp(-d*p.q);a+=p.sev*e;b+=e*e;}
-    const g=b>0?a/b:0;let sse=0;for(const p of pts){const r=p.sev-g*Math.exp(-d*p.q);sse+=r*r;}
-    if(sse<best.sse)best={sse,delta:d,gamma:g};
-  }
-  const mean=pts.reduce((s,p)=>s+p.sev,0)/pts.length;
-  const sst=pts.reduce((s,p)=>s+(p.sev-mean)**2,0);
-  const r2=sst>0?1-best.sse/sst:1; // goodness-of-fit of the exponential to the measured profile
-  return{delta:best.delta,gamma:best.gamma,r2,shapeValid:best.delta>1e-3};
-}
-
-function runSim(clients,slaKey,costK,capABpct,capCpct,beta,wMin,pExp){
-  const slaViolBudget={"99.9%":0.001,"99.99%":0.0001,"99.999%":0.00001}[slaKey]||0.0001;
-
-  const totalLoad=new Float64Array(SLOTS);
-  const tLoad={batch:new Float64Array(SLOTS),gaming:new Float64Array(SLOTS),webshop:new Float64Array(SLOTS),office:new Float64Array(SLOTS)};
-  clients.forEach(c=>{for(let s=0;s<SLOTS;s++){totalLoad[s]+=c.workload[s];tLoad[c.type][s]+=c.workload[s]}});
-  const peak=Math.max(...totalLoad);
-  const totalWorkAll=clients.reduce((s,c)=>s+c.totalWork,0);
-  const sumNTheta=clients.reduce((s,c)=>s+c.totalWork*c.theta,0); // Σ nθ (workload-weighted sensitivity)
-
-  // === Fixed capacities ===  A & B share the deployed (conventional-SLA) capacity; C is the
-  // underdeployment slider; D is honest per-window provisioning. Capacity is NOT optimized here
-  // (that dual problem lives in the Infrastructure Cost Sensitivity tab; see preprint 7.8).
-  const capA=peak*capABpct/100, capB=capA, capC=peak*capCpct/100;
-  let dLo=peak*0.5,dHi=peak*1.01;
-  for(let iter=0;iter<40;iter++){const mid=(dLo+dHi)/2;if(maxSlotSeverity(totalLoad,mid)<=slaViolBudget)dHi=mid;else dLo=mid;}
-  const capD=dHi;
-
-  // === Measured contract shape ===  Run DRR over the real load at the deployed capacity to get the
-  // realized severity-vs-position profile, then fit γ·e^(−δq) to it. δ is now MEASURED from the
-  // scheduler (β, wMin and the load) rather than a free slider; it feeds both the self-selection
-  // FOC and the published curve shape. The profile is a property of position (not of q*), so there
-  // is no circularity with self-selection.
-  const profile=drrSeverityProfile(totalLoad,capA,beta,wMin);
-  const fit=fitDelta(profile);
-  const dqDelta=fit.shapeValid?fit.delta:1.5; // fall back to a sane decreasing shape if the fit is invalid
-
-  // === Self-selection (per unit of work) ===
-  // Each client solves its first-order condition for the burden-minimizing position against the
-  // published contract  p(q)=e^(αq),  d(q)=γe^(−δq):
-  //     q*(θ) = ½ + ln(θ/θ_ref)/(α+δ),   θ_ref = geometric-mean sensitivity.
-  // Closed form, monotone increasing in θ (incentive compatibility; preprint Prop. 3). The price
-  // shape α is exogenous and δ is measured from DRR, so positions are stable — no fixed point.
-  const thetaRef=Math.exp(clients.reduce((s,c)=>s+Math.log(c.theta),0)/clients.length);
-  const aPlusD=pExp+dqDelta;
-  const clientQ=clients.map(c=>Math.max(0,Math.min(1,0.5+Math.log(c.theta/thetaRef)/aPlusD)));
-
-  // === ε(C): the conserved total severity = (total unmet demand)/(total work) over the cycle ===
-  // Under ANY allocation the same unmet demand is shared out, so a separated menu only
-  // REDISTRIBUTES it (Theorem 1 = pure reallocation). ε(C) is also the pooled per-unit severity.
-  const epsAt=(cap)=>{let u=0;for(let s=0;s<SLOTS;s++)if(totalLoad[s]>cap)u+=totalLoad[s]-cap;return u/totalWorkAll;};
-  const epsAB=epsAt(capA), epsC=epsAt(capC), epsD=epsAt(capD);
-
-  // === Published convex contract d(q)=γ·e^(−δq) ∈ [0,1] (per unit of work) ===
-  // d(q)=E[v|q] is the expected violation severity (v∈[0,1], 0 = perfect, 1 = complete failure;
-  // preprint §4.1, §4.5). SHAPE δ is measured from the DRR profile (diminishing-returns convexity,
-  // Kleinrock §3.8); LEVEL γ is scaled so the work-weighted mean of d(q*) equals the conserved
-  // budget ε(capAB), so both welfare arms stay on the same mean and W_pooled − W_separated is the
-  // EXACT rearrangement gain. This published curve IS the contractible ceiling (preprint §5.1): the
-  // work-conserving DRR severity stays at/below it within tolerance. d(q) is clamped to ≤1 for safety.
-  const dShape=(q)=>Math.exp(-dqDelta*q);
-  const meanShape=clients.reduce((s,c,i)=>s+c.totalWork*dShape(clientQ[i]),0)/totalWorkAll;
-  const dGamma=meanShape>0?epsAB/meanShape:0;
-  const dAt=(q)=>Math.min(1,dGamma*dShape(q));
-  const clientD=clients.map((c,i)=>dAt(clientQ[i])); // per-unit severity each client gets = d(q*)
-
-  // === Welfare loss W = Σ n·θ·d(q) ===  A (separated): each client's own d(q*).  B/C/D (pooled): ε.
-  const dmgA=clients.reduce((s,c,i)=>s+c.totalWork*c.theta*clientD[i],0);
-  const dmgB=epsAB*sumNTheta, dmgC=epsC*sumNTheta, dmgD=epsD*sumNTheta;
-  const infraA=capA*costK, infraB=capB*costK, infraC=capC*costK, infraD=capD*costK;
-
-  // Unit prices (infrastructure pass-through per unit of work)
-  const upA=infraA/totalWorkAll, upB=infraB/totalWorkAll, upC=infraC/totalWorkAll, upD=infraD/totalWorkAll;
-
-  // d(q) curve + per-client scatter + measured DRR profile (all severities ∈ [0,1]).
-  //  • dqCurve   — the published convex contract d(q) (the ceiling; clients self-select on THIS).
-  //  • dqScatter — each client at its solved position q* on the published curve, type-tagged.
-  //  • dqMeasured— the work-conserving DRR severity-vs-position profile the contract is fitted to.
-  const dqCurve=[];for(let qi=0;qi<=100;qi++){const q=qi/100;dqCurve.push({q,d:dAt(q)});}
-  const dqStep=Math.max(1,Math.floor(clients.length/240));
-  const dqScatter=[];for(let i=0;i<clients.length;i+=dqStep)dqScatter.push({q:Math.round(clientQ[i]*1000)/1000,d:Math.round(clientD[i]*1e5)/1e5,type:clients[i].type});
-  const dqMeasured=profile.map(p=>({q:Math.round(p.q*1000)/1000,d:Math.round(p.sev*1e5)/1e5}));
-
-  // Per-type work-weighted aggregates (mean θ, mean q*, mean d(q*)) for the rearrangement view.
-  const TYPES=["gaming","webshop","office","batch"];
-  const ag={};for(const t of TYPES)ag[t]={n:0,nq:0,nd:0,th:0,cnt:0};
-  clients.forEach((c,i)=>{const a=ag[c.type];a.n+=c.totalWork;a.nq+=c.totalWork*clientQ[i];a.nd+=c.totalWork*clientD[i];a.th+=c.theta;a.cnt++;});
-  const typeRows=TYPES.map(t=>{const a=ag[t];return{type:t,theta:a.th/a.cnt,q:a.nq/a.n,d:a.nd/a.n};});
-
-  // Per-type burden breakdown: price (n·unitPrice) + damage (n·θ·d). A uses d(q*); B/C/D use ε.
-  const mkTb=(getD,up)=>{const tw={};for(const t of TYPES)tw[t]={price:0,dmg:0};clients.forEach((c,i)=>{tw[c.type].price+=c.totalWork*up;tw[c.type].dmg+=c.totalWork*c.theta*getD(i);});return tw;};
-  const tbA=mkTb(i=>clientD[i],upA), tbB=mkTb(()=>epsAB,upB), tbC=mkTb(()=>epsC,upC), tbD=mkTb(()=>epsD,upD);
-  const maxSevC=maxSlotSeverity(totalLoad,capC), maxSevD=maxSlotSeverity(totalLoad,capD);
-
-  // === Infrastructure-cost sensitivity: provider trades C·k against W(C) ===
-  // ε(C) falls as capacity rises. W_pool(C)=ε(C)·Σnθ; W_sep(C)=(dmgA/εAB)·ε(C) — positions are
-  // fixed, the d-level scales with ε, so both → 0 as C → peak. Marginal damage prevented = −dW/dC.
-  const sepFac=epsAB>0?dmgA/epsAB:0;
-  const capGrid=[];
-  for(let p=55;p<=100;p+=1){const C=peak*p/100,e=epsAt(C);capGrid.push({pct:p,C,Wsep:sepFac*e,Wpool:e*sumNTheta});}
-  const margData=[];
-  for(let i=1;i<capGrid.length-1;i++){const dC=capGrid[i+1].C-capGrid[i-1].C;
-    margData.push({pct:capGrid[i].pct,mSep:-(capGrid[i+1].Wsep-capGrid[i-1].Wsep)/dC,mPool:-(capGrid[i+1].Wpool-capGrid[i-1].Wpool)/dC});}
-  const optCapBy=(key)=>{let b=capGrid[0],bH=Infinity;for(const g of capGrid){const H=g.C*costK+g[key];if(H<bH){bH=H;b=g;}}return b;};
-  const optWfq=optCapBy('Wsep'),optPool=optCapBy('Wpool');
-  const kSweep=[];
-  for(let kk=1;kk<=50;kk+=1){let bw=Infinity,Ww=0;
-    for(const g of capGrid){const Hw=g.C*kk+g.Wsep;if(Hw<bw){bw=Hw;Ww=g.Wsep;}}
-    kSweep.push({k:kk,Wsep:Ww});}
-
-  // Load profile chart data (demand by type over the cycle + capacity overlays).
-  const loadData=[];
-  for(let s=0;s<SLOTS;s++)loadData.push({hour:slotToHour(s),batch:tLoad.batch[s],office:tLoad.office[s],webshop:tLoad.webshop[s],gaming:tLoad.gaming[s],capA,capC,capD});
-  const tc={batch:0,gaming:0,webshop:0,office:0};
-  clients.forEach(c=>tc[c.type]++);
-
-  return{loadData,dqCurve,dqScatter,dqMeasured,typeRows,thetaRef,dqDelta,dGamma,
-    shapeValid:fit.shapeValid,r2:fit.r2,epsAB,epsC,epsD,
-    margData,kSweep,optWfq,optPool,capA,capB,capC,capD,peak,
-    infraA,infraB,infraC,infraD,dmgA,dmgB,dmgC,dmgD,
-    burdenA:infraA+dmgA,burdenB:infraB+dmgB,burdenC:infraC+dmgC,burdenD:infraD+dmgD,
-    upA,upB,upC,upD,tbA,tbB,tbC,tbD,
-    actualSlaD:(1-epsD)*100,maxSevC,maxSevD,avgSevC:epsC,availAB:1-epsAB,
-    tc,totalWorkAll};
-}
 
 const Sl=({label,value,onChange,min,max,step,color})=>(<div style={{marginBottom:3}}><div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:color||"#94a3b8"}}><span>{label}</span><span style={{color:"#1e293b",fontFamily:"monospace",fontSize:10}}>{typeof value==="number"&&value%1!==0?value.toFixed(1):value}</span></div><input type="range" min={min} max={max} step={step} value={value} onChange={e=>onChange(Number(e.target.value))} style={{width:"100%",accentColor:color||"#6366f1",height:3}}/></div>);
 const St=({label,value,color="#e2e8f0",sub})=>(<div style={{background:"#f8fafc",borderRadius:5,padding:"4px 6px",flex:1,minWidth:75}}><div style={{fontSize:7,color:"#94a3b8",textTransform:"uppercase",letterSpacing:0.6}}>{label}</div><div style={{fontSize:12,fontWeight:700,color,fontFamily:"monospace"}}>{value}</div>{sub&&<div style={{fontSize:7,color:"#94a3b8"}}>{sub}</div>}</div>);
@@ -227,19 +15,20 @@ const CL={A:"#047857",B:"#6d28d9",C:"#b91c1c",D:"#1d4ed8"};
 const tC={gaming:"#be185d",webshop:"#b45309",office:"#0369a1",batch:"#334155"};
 
 export default function App(){
-  const[ratios,setRatios]=useState({batch:25,gaming:25,webshop:30,office:20});
-  const[thetas,setThetas]=useState({batch:0.5,gaming:16,webshop:8,office:3});
-  const[peakMins,setPeakMins]=useState({batch:22,gaming:20,webshop:14,office:9});
-  const[peakMaxs,setPeakMaxs]=useState({batch:6,gaming:22,webshop:21,office:17});
-  const[sigmas,setSigmas]=useState({batch:3.5,gaming:1.5,webshop:1,office:4});
-  const[sla,setSla]=useState("99.99%");
-  const[costK,setCostK]=useState(40);
-  const[capABpct,setCapABpct]=useState(60);
-  const[capCpct,setCapCpct]=useState(48);
-  const[beta,setBeta]=useState(BETA_DEFAULT);
-  const[wMin,setWMin]=useState(W_MIN_DEFAULT);
-  const[seed,setSeed]=useState(42);
-  const[pExp,setPExp]=useState(PRICE_EXPONENT_DEFAULT);
+  // Every slider starts from DEFAULTS in engine.js, the same base case the tests and sweeps use.
+  const[ratios,setRatios]=useState(DEFAULTS.ratios);
+  const[thetas,setThetas]=useState(DEFAULTS.thetas);
+  const[peakMins,setPeakMins]=useState(DEFAULTS.peakMins);
+  const[peakMaxs,setPeakMaxs]=useState(DEFAULTS.peakMaxs);
+  const[sigmas,setSigmas]=useState(DEFAULTS.sigmas);
+  const[sla,setSla]=useState(DEFAULTS.sla);
+  const[costK,setCostK]=useState(DEFAULTS.costK);
+  const[capABpct,setCapABpct]=useState(DEFAULTS.capABpct);
+  const[capCpct,setCapCpct]=useState(DEFAULTS.capCpct);
+  const[beta,setBeta]=useState(DEFAULTS.beta);
+  const[wMin,setWMin]=useState(DEFAULTS.wMin);
+  const[seed,setSeed]=useState(DEFAULTS.seed);
+  const[pExp,setPExp]=useState(DEFAULTS.pExp);
   const[showNotes,setShowNotes]=useState(true);
   const[tab,setTab]=useState("load");
   const sR=useCallback((k,v)=>setRatios(p=>({...p,[k]:v})),[]);
@@ -248,7 +37,7 @@ export default function App(){
   const sPx=useCallback((k,v)=>setPeakMaxs(p=>({...p,[k]:v})),[]);
   const sS=useCallback((k,v)=>setSigmas(p=>({...p,[k]:v})),[]);
 
-  const clients=useMemo(()=>gen(1000,ratios,thetas,peakMins,peakMaxs,sigmas,seed),[ratios,thetas,peakMins,peakMaxs,sigmas,seed]);
+  const clients=useMemo(()=>gen(DEFAULTS.n,ratios,thetas,peakMins,peakMaxs,sigmas,seed),[ratios,thetas,peakMins,peakMaxs,sigmas,seed]);
   const sim=useMemo(()=>runSim(clients,sla,costK,capABpct,capCpct,beta,wMin,pExp),[clients,sla,costK,capABpct,capCpct,beta,wMin,pExp]);
   const pqCurveData=useMemo(()=>{const d=[];for(let qi=0;qi<=100;qi++){const q=qi/100;d.push({q,price:Math.exp(pExp*q)});}return d;},[pExp]);
 
@@ -412,7 +201,9 @@ export default function App(){
           const eps=sim.epsAB;
           const rows=[...sim.typeRows].sort((a,b)=>a.theta-b.theta); // ascending θ: batch … gaming
           return(<div style={{background:"#f8fafc",borderRadius:6,padding:11}}>
-          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>Theorem 1: W_S {"<"} W_P — self-selection minimizes welfare loss</div>
+          {/* Chart headings describe what is plotted; the interpretation belongs to the reader (and
+              to the paper), not to the axis furniture. */}
+          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>Per-unit severity d(q*) at self-selected positions, against the pooled level ε</div>
           {showNotes&&<div style={{fontSize:10,color:"#475569",marginBottom:7,lineHeight:1.5}}>
             Pure reallocation: A and B deploy the SAME capacity, so the same total severity ε is shared out — separation only moves it across positions. Each client self-selects q*, receiving per-unit severity d(q*) (bars); pooling gives everyone ε (dashed line). High-θ types self-select to low-d(q*) positions, low-θ types to high — a negative pairing — so the θ-weighted sum W_S = Σ n·θ·d(q*) falls below W_P = ε·Σ n·θ. That gap is the rearrangement inequality.
           </div>}
@@ -441,14 +232,14 @@ export default function App(){
           const step=Math.max(1,Math.floor(clients.length/200));
           for(let i=0;i<clients.length;i+=step){const c=clients[i];const q=optQ(c.theta);clientPqPts[c.type].push({q:Math.round(q*1000)/1000,price:Math.exp(pExp*q)});}
           return(<div style={{background:"#f8fafc",borderRadius:6,padding:11}}>
-          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>d(q) and p(q) — The Curves That Drive Self-Selection</div>
+          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>d(q) and p(q): measured severity, published contract, and self-selected positions</div>
           {showNotes&&<div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
             d(q) is the provider's published <strong>convex contract</strong> — decreasing (front of queue = low severity) and convex by the diminishing returns of priority scheduling (Kleinrock). p(q) is increasing-convex (front = expensive). Each client minimizes h(θ,q) = p(q) + θ·d(q) by choosing q, so high-θ clients self-select to the front (low severity, high price) and low-θ to the back. The dots on the d(q) chart are the clients sitting on the curve at their solved positions d(q*); the same self-selection shows on p(q). q* = 0.5 + ln(θ/θ_ref)/(α+δ), calibrated so the median type sits at q=0.5. (The exponential is one convex form — any convex d(q) gives the same separation.)
           </div>}
           <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
             <div style={{flex:1,minWidth:280}}>
               <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>d(q) — Measured Severity &amp; Published Contract</div>
-              <div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>d(q) = E[v|q] is the expected violation severity, a fraction in [0,1] (0 = perfect, 1 = complete failure). Grey dots: the work-conserving DRR-measured severity at each queue position — the cloud the contract is fitted to (exponential fit δ = {sim.dqDelta.toFixed(2)}, <b>R² = {sim.r2!=null?sim.r2.toFixed(3):"—"}</b>). Red curve: the published contract d(q) = γ·e^(−δq) — the SLA <b>ceiling</b> — with δ measured from the scheduler and level mean-matched to ε. Coloured dots: clients at their self-selected q*, by type.</div>
+              {showNotes&&<div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>d(q) = E[v|q] is the expected violation severity, a fraction in [0,1] (0 = perfect, 1 = complete failure). Grey dots: the work-conserving DRR-measured severity at each queue position — the cloud the contract is fitted to (exponential fit δ = {sim.dqDelta.toFixed(2)}, <b>R² = {sim.r2!=null?sim.r2.toFixed(3):"—"}</b>). Red curve: the published contract d(q) = γ·e^(−δq) — the SLA <b>ceiling</b> — with δ measured from the scheduler and level mean-matched to ε. Coloured dots: clients at their self-selected q*, by type.</div>}
               <ResponsiveContainer width="100%" height={250}>
                 <LineChart margin={{top:8,right:12,left:8,bottom:20}}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0"/>
@@ -464,7 +255,7 @@ export default function App(){
             </div>
             <div style={{flex:1,minWidth:280}}>
               <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>p(q) — Price Schedule &amp; Self-Selection</div>
-              <div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Green line: the published price schedule p(q) = e^({pExp}·q). Coloured dots: where each client type self-selects — the solved optimal position q* for its sensitivity θ — with one faint dot per client and the large labelled dot at the type mean.</div>
+              {showNotes&&<div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Green line: the published price schedule p(q) = e^({pExp}·q). Coloured dots: where each client type self-selects — the solved optimal position q* for its sensitivity θ — with one faint dot per client and the large labelled dot at the type mean.</div>}
               <ResponsiveContainer width="100%" height={250}>
                 <ComposedChart data={pqCurveData} margin={{top:16,right:12,left:8,bottom:20}}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0"/>
@@ -492,14 +283,14 @@ export default function App(){
         </div>);})()}
 
         {tab==="infra"&&(<div style={{background:"#f8fafc",borderRadius:6,padding:11}}>
-          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>Infrastructure Cost Sensitivity — the Provider's Hardware ↔ Damage Tradeoff</div>
+          <div style={{fontSize:11,fontWeight:700,color:"#0f172a",marginBottom:2}}>Infrastructure cost sensitivity: marginal damage prevented against marginal capacity cost</div>
           {showNotes&&<div style={{fontSize:10,color:"#475569",marginBottom:10,lineHeight:1.5}}>
             The provider invests in capacity up to the point where one more unit of hardware cost (k) equals the customer damage that unit prevents (−dW/dC). Under the contractible menu this is also the <em>profit-maximizing</em> choice: publishing d(q) lets the provider charge for protection, so its marginal incentive matches the marginal customer damage ([1], §5.4). Capacity is only the instrument — the margin is the point. <strong>Left:</strong> the marginal balance; the provider sits where the damage curve meets k. <strong>Right:</strong> the resulting welfare loss W*(k) — as hardware cheapens (k→0) the provider provisions to peak and welfare loss vanishes.
           </div>}
           <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
             <div style={{flex:1,minWidth:280}}>
-              <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>Marginal balance: hardware cost meets damage</div>
-              <div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Each curve shows the marginal customer damage prevented by one more unit of capacity (−dW/dC), under the separated menu (green) and pooled (purple). The dashed line is the marginal hardware cost, k = {costK}. The provider buys capacity up to where a curve meets the line.</div>
+              <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>Marginal damage prevented per unit of capacity (−dW/dC) and the unit cost k</div>
+              {showNotes&&<div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Each curve shows the marginal customer damage prevented by one more unit of capacity (−dW/dC), under the separated menu (green) and pooled (purple). The dashed line is the marginal hardware cost, k = {costK}. The provider buys capacity up to where a curve meets the line.</div>}
               <ResponsiveContainer width="100%" height={250}>
                 <LineChart data={sim.margData} margin={{top:22,right:44,left:8,bottom:20}}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0"/>
@@ -515,8 +306,8 @@ export default function App(){
               </ResponsiveContainer>
             </div>
             <div style={{flex:1,minWidth:280}}>
-              <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>Consequence: welfare loss vs hardware cost</div>
-              <div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Welfare loss W*(k) at the provider's profit-maximizing capacity, as the hardware cost k sweeps from cheap to dear. When hardware is cheap (k→0) it provisions to peak and W*→0; as hardware gets expensive it economizes, accepting more low-θ damage, so W* rises.</div>
+              <div style={{fontSize:10,fontWeight:600,color:"#0f172a",marginBottom:4}}>Welfare loss at the provider&apos;s chosen capacity, W*(k)</div>
+              {showNotes&&<div style={{fontSize:9,color:"#64748b",marginBottom:4,lineHeight:1.45,minHeight:42}}>Welfare loss W*(k) at the provider's profit-maximizing capacity, as the hardware cost k sweeps from cheap to dear. When hardware is cheap (k→0) it provisions to peak and W*→0; as hardware gets expensive it economizes, accepting more low-θ damage, so W* rises.</div>}
               <ResponsiveContainer width="100%" height={250}>
                 <LineChart data={sim.kSweep} margin={{top:22,right:18,left:8,bottom:20}}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0"/>
